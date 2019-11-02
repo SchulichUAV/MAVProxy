@@ -21,6 +21,18 @@ delayedPackets = frozenset([ 'MISSION_CURRENT', 'SYS_STATUS', 'VFR_HUD',
                   'NAV_CONTROLLER_OUTPUT' ])
 activityPackets = frozenset([ 'HEARTBEAT', 'GPS_RAW_INT', 'GPS_RAW', 'GLOBAL_POSITION_INT', 'SYS_STATUS' ])
 
+preferred_ports = [
+    '*FTDI*',
+    "*Arduino_Mega_2560*",
+    "*3D*",
+    "*USB_to_UART*",
+    '*Ardu*',
+    '*PX4*',
+    '*Hex_*',
+    '*Holybro_*',
+    '*mRo*',
+    '*FMU*']
+
 class LinkModule(mp_module.MPModule):
 
     def __init__(self, mpstate):
@@ -30,6 +42,7 @@ class LinkModule(mp_module.MPModule):
                           'add (SERIALPORT)',
                           'attributes (LINK) (ATTRIBUTES)',
                           'remove (LINKS)'])
+        self.add_command('vehicle', self.cmd_vehicle, "vehicle control")
         self.no_fwd_types = set()
         self.no_fwd_types.add("BAD_DATA")
         self.add_completion_function('(SERIALPORT)', self.complete_serial_ports)
@@ -64,14 +77,7 @@ class LinkModule(mp_module.MPModule):
 
     def complete_serial_ports(self, text):
         '''return list of serial ports'''
-        ports = mavutil.auto_detect_serial(preferred_list=[
-            '*FTDI*',
-            "*Arduino_Mega_2560*",
-            "*3D_Robotics*",
-            "*USB_to_UART*",
-            '*Ardu*',
-            '*PX4*',
-            '*FMU*'])
+        ports = mavutil.auto_detect_serial(preferred_list=preferred_ports)
         return [ p.device for p in ports ]
 
     def complete_links(self, text):
@@ -243,15 +249,7 @@ class LinkModule(mp_module.MPModule):
 
     def cmd_link_ports(self):
         '''show available ports'''
-        ports = mavutil.auto_detect_serial(preferred_list=[
-            '*FTDI*',
-            "*Arduino_Mega_2560*",
-            "*3D*",
-            "*USB_to_UART*",
-            '*Ardu*',
-            '*PX4*',
-            '*Hex*',
-            '*FMU*'])
+        ports = mavutil.auto_detect_serial(preferred_list=preferred_ports)
         for p in ports:
             print("%s : %s : %s" % (p.device, p.description, p.hwid))
 
@@ -331,7 +329,7 @@ class LinkModule(mp_module.MPModule):
         master.highest_msec = msec
         if msec > self.status.highest_msec:
             self.status.highest_msec = msec
-        if msec < self.status.highest_msec and len(self.mpstate.mav_master) > 1:
+        if msec < self.status.highest_msec and len(self.mpstate.mav_master) > 1 and self.mpstate.settings.checkdelay:
             master.link_delayed = True
         else:
             master.link_delayed = False
@@ -378,6 +376,12 @@ class LinkModule(mp_module.MPModule):
         '''link message handling for an upstream link'''
         if self.settings.target_system != 0 and m.get_srcSystem() != self.settings.target_system:
             # don't process messages not from our target
+            if m.get_type() == "BAD_DATA":
+                if self.mpstate.settings.shownoise and mavutil.all_printable(m.data):
+                    out = m.data
+                    if type(m.data) == bytearray:
+                        out = m.data.decode('ascii')
+                    self.mpstate.console.write(out, bg='red')
             return
 
         if self.settings.target_system != 0 and master.target_system != self.settings.target_system:
@@ -386,6 +390,7 @@ class LinkModule(mp_module.MPModule):
 
         if self.settings.target_component != 0 and master.target_component != self.settings.target_component:
             # keep the pymavlink level target component aligned with the MAVProxy setting
+            print("change target_component %u" % self.settings.target_component)
             master.target_component = self.settings.target_component
             
         mtype = m.get_type()
@@ -509,10 +514,6 @@ class LinkModule(mp_module.MPModule):
                 # cope with wrap
                 self.mpstate.attitude_time_s = att_time
 
-            
-        elif mtype == "BAD_DATA":
-            if self.mpstate.settings.shownoise and mavutil.all_printable(m.data):
-                self.mpstate.console.write(str(m.data), bg='red')
         elif mtype in [ "COMMAND_ACK", "MISSION_ACK" ]:
             self.mpstate.console.writeln("Got MAVLink msg: %s" % m)
 
@@ -563,6 +564,11 @@ class LinkModule(mp_module.MPModule):
             for sysid in self.mpstate.sysid_outputs:
                 self.mpstate.sysid_outputs[sysid].write(m.get_msgbuf())
 
+            if self.mpstate.settings.fwdpos:
+                for link in self.mpstate.mav_master:
+                    if link != master:
+                        link.write(m.get_msgbuf())
+
         # and log them
         if mtype not in dataPackets and self.mpstate.logqueue:
             # put link number in bottom 2 bits, so we can analyse packet
@@ -592,7 +598,7 @@ class LinkModule(mp_module.MPModule):
             self.status.last_message = time.time()
             master.last_message = self.status.last_message
 
-        if master.link_delayed:
+        if master.link_delayed and self.mpstate.settings.checkdelay:
             # don't process delayed packets that cause double reporting
             if mtype in delayedPackets:
                 return
@@ -629,6 +635,32 @@ class LinkModule(mp_module.MPModule):
                         exc_type, exc_value, exc_traceback = sys.exc_info()
                         traceback.print_exception(exc_type, exc_value, exc_traceback,
                                                   limit=2, file=sys.stdout)
+
+    def cmd_vehicle(self, args):
+        '''handle vehicle commands'''
+        if len(args) < 1:
+            print("Usage: vehicle SYSID[:COMPID]")
+            return
+        a = args[0].split(':')
+        self.mpstate.settings.target_system = int(a[0])
+        if len(a) > 1:
+            self.mpstate.settings.target_component = int(a[1])
+
+        # change default link based on most recent HEARTBEAT
+        best_link = 0
+        best_timestamp = 0
+        for i in range(len(self.mpstate.mav_master)):
+            m = self.mpstate.mav_master[i]
+            m.target_system = self.mpstate.settings.target_system
+            m.target_component = self.mpstate.settings.target_component
+            if 'HEARTBEAT' in m.messages:
+                stamp = m.messages['HEARTBEAT']._timestamp
+                src_system = m.messages['HEARTBEAT'].get_srcSystem()
+                if stamp > best_timestamp:
+                    best_link = i
+                    best_timestamp = stamp
+        self.mpstate.settings.link = best_link + 1
+        print("Set vehicle %s (link %u)" % (args[0], best_link+1))
 
 def init(mpstate):
     '''initialise module'''

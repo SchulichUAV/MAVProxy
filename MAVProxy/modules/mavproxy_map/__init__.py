@@ -21,9 +21,8 @@ class MapModule(mp_module.MPModule):
         cmdname = "map"
         if self.instance > 1:
             cmdname += "%u" % self.instance
-        self.lat = None
-        self.lon = None
-        self.heading = 0
+        # lat/lon per system ID
+        self.lat_lon = {}
         self.wp_change_time = 0
         self.fence_change_time = 0
         self.rally_change_time = 0
@@ -35,8 +34,6 @@ class MapModule(mp_module.MPModule):
         self.moving_rally = None
         self.mission_list = None
         self.icon_counter = 0
-        self.click_position = None
-        self.click_time = 0
         self.draw_line = None
         self.draw_callback = None
         self.have_global_position = False
@@ -45,6 +42,7 @@ class MapModule(mp_module.MPModule):
         self.ElevationMap = mp_elevation.ElevationModel()
         self.last_unload_check_time = time.time()
         self.unload_check_interval = 0.1 # seconds
+        self.trajectory_layers = set()
         self.map_settings = mp_settings.MPSettings(
             [ ('showgpspos', int, 1),
               ('showgps2pos', int, 1),
@@ -54,6 +52,7 @@ class MapModule(mp_module.MPModule):
               ('brightness', float, 1),
               ('rallycircle', bool, False),
               ('loitercircle',bool, False),
+              ('showclicktime',int, 2),
               ('showdirection', bool, False)])
         
         service='MicrosoftHyb'
@@ -118,10 +117,15 @@ class MapModule(mp_module.MPModule):
         self.default_popup.add(menu)
         self.map.add_object(mp_slipmap.SlipDefaultPopup(self.default_popup, combine=True))
 
+    def remove_menu(self, menu):
+        '''add to the default popup menu'''
+        from MAVProxy.modules.mavproxy_map import mp_slipmap
+        self.default_popup.remove(menu)
+        self.map.add_object(mp_slipmap.SlipDefaultPopup(self.default_popup, combine=True))
 
     def show_position(self):
         '''show map position click information'''
-        pos = self.click_position
+        pos = self.mpstate.click_location
         dms = (mp_util.degrees_to_dms(pos[0]), mp_util.degrees_to_dms(pos[1]))
         msg =  "Coordinates in WGS84\n"
         msg += "Decimal: %.6f %.6f\n" % (pos[0], pos[1])
@@ -431,8 +435,7 @@ class MapModule(mp_module.MPModule):
         if not isinstance(obj, mp_slipmap.SlipMouseEvent):
             return
         if obj.event.leftIsDown and self.moving_rally is not None:
-            self.click_position = obj.latlon
-            self.click_time = time.time()
+            self.mpstate.click(obj.latlon)
             self.mpstate.functions.process_stdin("rally move %u" % self.moving_rally)
             self.moving_rally = None
             return
@@ -441,14 +444,12 @@ class MapModule(mp_module.MPModule):
             self.moving_rally = None
             return
         if obj.event.leftIsDown and self.moving_wp is not None:
-            self.click_position = obj.latlon
-            self.click_time = time.time()
+            self.mpstate.click(obj.latlon)
             self.mpstate.functions.process_stdin("wp move %u" % self.moving_wp)
             self.moving_wp = None
             return
         if obj.event.leftIsDown and self.moving_fencepoint is not None:
-            self.click_position = obj.latlon
-            self.click_time = time.time()
+            self.mpstate.click(obj.latlon)
             self.mpstate.functions.process_stdin("fence move %u" % (self.moving_fencepoint+1))
             self.moving_fencepoint = None
             return
@@ -461,22 +462,24 @@ class MapModule(mp_module.MPModule):
             self.moving_fencepoint = None
             return
         elif obj.event.leftIsDown:
-            if time.time() - self.click_time > 0.1:
-                self.click_position = obj.latlon
-                self.click_time = time.time()
+            if (self.mpstate.click_time is None or
+                time.time() - self.mpstate.click_time > 0.1):
+                self.mpstate.click(obj.latlon)
                 self.drawing_update()
-
-            if self.module('misseditor') is not None:
-                self.module('misseditor').update_map_click_position(self.click_position)
 
         if obj.event.rightIsDown:
             if self.draw_callback is not None:
                 self.drawing_end()
                 return
-            if time.time() - self.click_time > 0.1:
-                self.click_position = obj.latlon
-                self.click_time = time.time()
+            if (self.mpstate.click_time is None or
+                time.time() - self.mpstate.click_time > 0.1):
+                self.mpstate.click(obj.latlon)
 
+    def click_updated(self):
+        '''called when the click position has changed'''
+        if self.map_settings.showclicktime == 0:
+            return
+        self.map.add_object(mp_slipmap.SlipClickLocation(self.mpstate.click_location, timeout=self.map_settings.showclicktime))
 
     def unload(self):
         '''unload module'''
@@ -510,7 +513,7 @@ class MapModule(mp_module.MPModule):
         from MAVProxy.modules.mavproxy_map import mp_slipmap
         if self.draw_callback is None:
             return
-        self.draw_line.append(self.click_position)
+        self.draw_line.append(self.mpstate.click_location)
         if len(self.draw_line) > 1:
             self.map.add_object(mp_slipmap.SlipPolygon('drawing', self.draw_line,
                                                           layer='Drawing', linewidth=2, colour=(128,128,255)))
@@ -534,7 +537,7 @@ class MapModule(mp_module.MPModule):
 
     def cmd_set_home(self, args):
         '''called when user selects "Set Home (with height)" on map'''
-        (lat, lon) = (self.click_position[0], self.click_position[1])
+        (lat, lon) = (self.mpstate.click_location[0], self.mpstate.click_location[1])
         alt = self.ElevationMap.GetElevation(lat, lon)
         print("Setting home to: ", lat, lon, alt)
         self.master.mav.command_long_send(
@@ -551,7 +554,7 @@ class MapModule(mp_module.MPModule):
 
     def cmd_set_homepos(self, args):
         '''called when user selects "Set Home" on map'''
-        (lat, lon) = (self.click_position[0], self.click_position[1])
+        (lat, lon) = (self.mpstate.click_location[0], self.mpstate.click_location[1])
         print("Setting home to: ", lat, lon)
         self.master.mav.command_int_send(
             self.settings.target_system, self.settings.target_component,
@@ -569,23 +572,23 @@ class MapModule(mp_module.MPModule):
 
     def cmd_set_origin(self, args):
         '''called when user selects "Set Origin (with height)" on map'''
-        (lat, lon) = (self.click_position[0], self.click_position[1])
+        (lat, lon) = (self.mpstate.click_location[0], self.mpstate.click_location[1])
         alt = self.ElevationMap.GetElevation(lat, lon)
         print("Setting origin to: ", lat, lon, alt)
         self.master.mav.set_gps_global_origin_send(
             self.settings.target_system,
-            lat*10000000, # lat
-            lon*10000000, # lon
-            alt*1000) # param7
+            int(lat*10000000), # lat
+            int(lon*10000000), # lon
+            int(alt*1000)) # param7
 
     def cmd_set_originpos(self, args):
         '''called when user selects "Set Origin" on map'''
-        (lat, lon) = (self.click_position[0], self.click_position[1])
+        (lat, lon) = (self.mpstate.click_location[0], self.mpstate.click_location[1])
         print("Setting origin to: ", lat, lon)
         self.master.mav.set_gps_global_origin_send(
             self.settings.target_system,
-            lat*10000000, # lat
-            lon*10000000, # lon
+            int(lat*10000000), # lat
+            int(lon*10000000), # lon
             0*1000) # no height change
 
     def cmd_zoom(self, args):
@@ -693,22 +696,24 @@ class MapModule(mp_module.MPModule):
                 self.map.set_position('GPS2' + vehicle, (lat, lon), rotation=m.cog*0.01)
 
         elif mtype == 'GLOBAL_POSITION_INT':
-            (self.lat, self.lon, self.heading) = (m.lat*1.0e-7, m.lon*1.0e-7, m.hdg*0.01)
-            if abs(self.lat) > 1.0e-3 or abs(self.lon) > 1.0e-3:
+            (lat, lon, heading) = (m.lat*1.0e-7, m.lon*1.0e-7, m.hdg*0.01)
+            self.lat_lon[m.get_srcSystem()] = (lat,lon)
+            if abs(lat) > 1.0e-3 or abs(lon) > 1.0e-3:
                 self.have_global_position = True
                 self.create_vehicle_icon('Pos' + vehicle, 'red', follow=True)
                 if len(self.vehicle_type_by_sysid) > 1:
                     label = str(sysid)
                 else:
                     label = None
-                self.map.set_position('Pos' + vehicle, (self.lat, self.lon), rotation=self.heading, label=label, colour=(255,255,255))
+                self.map.set_position('Pos' + vehicle, (lat, lon), rotation=heading, label=label, colour=(255,255,255))
                 self.map.set_follow_object('Pos' + vehicle, self.is_primary_vehicle(m))
 
         elif mtype == 'LOCAL_POSITION_NED' and not self.have_global_position:
-            (self.lat, self.lon) = mp_util.gps_offset(0, 0, m.x, m.y)
-            self.heading = math.degrees(math.atan2(m.vy, m.vx))
+            (lat, lon) = mp_util.gps_offset(0, 0, m.x, m.y)
+            self.lat_lon[m.get_srcSystem()] = (lat,lon)
+            heading = math.degrees(math.atan2(m.vy, m.vx))
             self.create_vehicle_icon('Pos' + vehicle, 'red', follow=True)
-            self.map.set_position('Pos' + vehicle, (self.lat, self.lon), rotation=self.heading)
+            self.map.set_position('Pos' + vehicle, (lat, lon), rotation=heading)
             self.map.set_follow_object('Pos' + vehicle, self.is_primary_vehicle(m))
 
         elif mtype == 'HOME_POSITION':
@@ -719,33 +724,39 @@ class MapModule(mp_module.MPModule):
                                                             icon, layer=3, rotation=0, follow=False))
 
         elif mtype == "NAV_CONTROLLER_OUTPUT":
-            if (self.master.flightmode in [ "AUTO", "GUIDED", "LOITER", "RTL", "QRTL", "QLOITER", "QLAND" ] and
-                self.lat is not None and self.lon is not None):
-                trajectory = [ (self.lat, self.lon),
-                               mp_util.gps_newpos(self.lat, self.lon, m.target_bearing, m.wp_dist) ]
-                self.map.add_object(mp_slipmap.SlipPolygon('trajectory', trajectory, layer='Trajectory',
-                                                                   linewidth=2, colour=(255,0,180)))
+            tlayer = 'Trajectory%u' % m.get_srcSystem()
+            if (self.master.flightmode in [ "AUTO", "GUIDED", "LOITER", "RTL", "QRTL", "QLOITER", "QLAND", "FOLLOW" ] and
+                m.get_srcSystem() in self.lat_lon):
+                (lat,lon) = self.lat_lon[m.get_srcSystem()]
+                trajectory = [ (lat, lon),
+                                mp_util.gps_newpos(lat, lon, m.target_bearing, m.wp_dist) ]
+                self.map.add_object(mp_slipmap.SlipPolygon('trajectory',
+                                                           trajectory, layer=tlayer,
+                                                               linewidth=2, colour=(255,0,180)))
+                self.trajectory_layers.add(tlayer)
             else:
-                self.map.add_object(mp_slipmap.SlipClearLayer('Trajectory'))
+                if tlayer in self.trajectory_layers:
+                    self.map.add_object(mp_slipmap.SlipClearLayer(tlayer))
+                    self.trajectory_layers.remove(tlayer)
 
         elif mtype == "POSITION_TARGET_GLOBAL_INT":
             # FIXME: base this off SYS_STATUS.MAV_SYS_STATUS_SENSOR_XY_POSITION_CONTROL?
-            if self.lat is None:
+            if not m.get_srcSystem() in self.lat_lon:
                 return
-            if self.lon is None:
-                return
-            if (self.master.flightmode in [ "AUTO", "GUIDED", "LOITER", "RTL", "QRTL", "QLOITER", "QLAND" ]):
+            tlayer = 'PostionTarget%u' % m.get_srcSystem()
+            (lat,lon) = self.lat_lon[m.get_srcSystem()]
+            if (self.master.flightmode in [ "AUTO", "GUIDED", "LOITER", "RTL", "QRTL", "QLOITER", "QLAND", "FOLLOW" ]):
                 lat_float = m.lat_int*1e-7
                 lon_float = m.lon_int*1e-7
                 vec = [ (lat_float, lon_float),
-                        (self.lat, self.lon) ]
+                        (lat, lon) ]
                 self.map.add_object(mp_slipmap.SlipPolygon('position_target',
                                                            vec,
-                                                           layer='PositionTarget',
+                                                           layer=tlayer,
                                                            linewidth=2,
                                                            colour=(0,255,0)))
             else:
-                self.map.add_object(mp_slipmap.SlipClearLayer('PositionTarget'))
+                self.map.add_object(mp_slipmap.SlipClearLayer(tlayer))
 
         if not self.is_primary_vehicle(m):
             # the rest should only be done for the primary vehicle
@@ -761,16 +772,18 @@ class MapModule(mp_module.MPModule):
             self.rally_change_time = time.time()
 
         # if the fence has changed, redisplay
-        if self.fence_change_time != self.module('fence').fenceloader.last_change:
+        if (self.module('fence') and
+            self.fence_change_time != self.module('fence').fenceloader.last_change):
             self.display_fence()
 
         # if the rallypoints have changed, redisplay
-        if self.rally_change_time != self.module('rally').rallyloader.last_change:
-            self.rally_change_time = self.module('rally').rallyloader.last_change
+        if (self.module('rally') and
+            self.rally_change_time != self.module('rally').last_change()):
+            self.rally_change_time = self.module('rally').last_change()
             icon = self.map.icon('rallypoint.png')
             self.map.add_object(mp_slipmap.SlipClearLayer('RallyPoints'))
-            for i in range(self.module('rally').rallyloader.rally_count()):
-                rp = self.module('rally').rallyloader.rally_point(i)
+            for i in range(self.module('rally').rally_count()):
+                rp = self.module('rally').rally_point(i)
                 popup = MPMenuSubMenu('Popup',
                                       items=[MPMenuItem('Rally Remove', returnkey='popupRallyRemove'),
                                              MPMenuItem('Rally Move', returnkey='popupRallyMove')])
