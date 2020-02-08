@@ -65,6 +65,7 @@ class suav(mp_module.MPModule):
 
     def mavlink_packet(self, m):
         '''handle mavlink packets'''
+        //print(m.get_type())
         if m.get_type() == 'GLOBAL_POSITION_INT':
             pass
         elif m.get_type() == 'STATUS_ALT_REQ':
@@ -73,7 +74,7 @@ class suav(mp_module.MPModule):
         elif m.get_type() == 'DROP_POPUP':
             print('Message Received: Glider DROPPED!')
             print(m.value)
-            sg.PopupNoButtons('Glider Drop!','Altitude: ' + m.value + 'ft', non_blocking=True, no_titlebar=True, font=('Arial', 25), keep_on_top=True, location=[4+255*(self.popcount//7),700-(110*self.popcount)%770])
+            sg.PopupNoButtons('Glider Drop!','Altitude: ' + str(m.value) + 'ft', non_blocking=True, no_titlebar=True, font=('Arial', 25), keep_on_top=True, location=[4+255*(self.popcount//7),700-(110*self.popcount)%770])
             self.popcount += 1
         elif m.get_type() == 'DATA16':
             if m.type == 150:
