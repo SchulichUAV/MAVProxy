@@ -5,8 +5,8 @@ rem This assumes InnoSetup is installed in C:\Program Files (x86)\Inno Setup 5
 rem   If it is not, change the INNOSETUP environment variable accordingly
 SETLOCAL enableextensions
 
-if "%PYTHON_LOCATION%" == "" (set "PYTHON_LOCATION=C:\Python36")
-if "%INNOSETUP%" == "" (set "INNOSETUP=C:\Program Files (x86)\Inno Setup 5")
+if "%PYTHON_LOCATION%" == "" (set "PYTHON_LOCATION=C:\Program Files (x86)\Python37-32")
+if "%INNOSETUP%" == "" (set "INNOSETUP=C:\Program Files (x86)\Inno Setup 6")
 
 rem get the version
 for /f "tokens=*" %%a in (
